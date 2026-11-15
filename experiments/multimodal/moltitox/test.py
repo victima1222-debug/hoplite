@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 import json
 import glob
+import copy
 import time
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
@@ -147,20 +148,22 @@ ckpt_paths = sorted(glob.glob(os.path.join(model_dir, "moltitox_seed*.pth"))) \
     or [os.path.join(model_dir, "moltitox.pth")]
 print(f"Evaluating ensemble of {len(ckpt_paths)} model(s): {[os.path.basename(p) for p in ckpt_paths]}")
 
+template = MoltiTox(
+    graph_encoder,
+    smiles_encoder,
+    image_encoder,
+    spectrum_encoder,
+    emb_dim = emb_dim,
+    hidden_dim= hidden_dim,
+    num_layers= num_layers,
+    num_fusion_layers=num_fusion_layers,
+    num_tasks=len(labels),
+    dropout=dropout
+)
 models = []
 for path in ckpt_paths:
-    m = MoltiTox(
-        graph_encoder,
-        smiles_encoder,
-        image_encoder,
-        spectrum_encoder,
-        emb_dim = emb_dim,
-        hidden_dim= hidden_dim,
-        num_layers= num_layers,
-        num_fusion_layers=num_fusion_layers,
-        num_tasks=len(labels),
-        dropout=dropout
-    ).to(device)
+    # Each member gets its own copy: checkpoints may contain fine-tuned encoder weights
+    m = copy.deepcopy(template).to(device)
     m.load_state_dict(torch.load(path, map_location=device), strict=False)
     m.eval()
     models.append(m)

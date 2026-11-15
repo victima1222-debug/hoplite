@@ -47,3 +47,50 @@ def warmup_cosine_scheduler(optimizer, total_steps: int, warmup_frac: float = 0.
         return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def _largest_module_list(module: torch.nn.Module) -> torch.nn.ModuleList:
+    """The Transformer block stack of a HF model (e.g. MoLFormer's `encoder.layer`)."""
+    lists = [m for m in module.modules() if isinstance(m, torch.nn.ModuleList)]
+    if not lists:
+        raise ValueError("no ModuleList found in encoder")
+    return max(lists, key=len)
+
+
+def configure_encoder_finetuning(graph_encoder, smiles_encoder, image_encoder, spectrum_encoder,
+                                 enabled: bool = True, smiles_top_blocks: int = 2):
+    """
+    Freeze all encoder weights, then (if enabled) unfreeze the parts worth adapting to the
+    toxicity task: the whole graph encoder, the top `smiles_top_blocks` MoLFormer blocks plus
+    its MLP head, ResNet stage 4 plus the image MLP head, and the spectrum MLP head. The
+    pretrained CReSS NMR model always stays frozen. Returns the list of unfrozen encoder
+    parameters so they can be given a lower learning rate.
+    """
+    for net in (graph_encoder, smiles_encoder, image_encoder, spectrum_encoder):
+        for p in net.parameters():
+            p.requires_grad = False
+    spectrum_encoder.missing_token.requires_grad = True
+
+    if not enabled:
+        return []
+
+    params = list(graph_encoder.parameters())
+    params += list(smiles_encoder.proj.parameters())
+    for block in _largest_module_list(smiles_encoder.encoder)[-smiles_top_blocks:]:
+        params += list(block.parameters())
+    params += list(image_encoder.backbone.layer4.parameters())
+    params += list(image_encoder.mlp.parameters())
+    params += list(spectrum_encoder.fc1.parameters()) + list(spectrum_encoder.fc2.parameters())
+    for p in params:
+        p.requires_grad = True
+    return params
+
+
+def snapshot_encoders(*encoders):
+    return [{k: v.detach().clone() for k, v in e.state_dict().items()} for e in encoders]
+
+
+def restore_encoders(encoders, snapshots):
+    """Reset shared encoders so every Optuna trial / ensemble seed starts from the same weights."""
+    for e, s in zip(encoders, snapshots):
+        e.load_state_dict(s, strict=False)

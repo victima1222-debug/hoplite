@@ -18,12 +18,17 @@ if ROOT not in sys.path:
 
 from models.models        import GraphEncoder, SMILESEncoder, ImageEncoder, SpectrumEncoder, MoltiTox
 from utils.dataset     import GraphDataset, SMILESDataset, ImageDataset, SpectrumDataset, MoltiToxDataset
-from utils.training    import set_seed, compute_pos_weight, masked_bce_loss, warmup_cosine_scheduler
+from utils.training    import (set_seed, compute_pos_weight, masked_bce_loss, warmup_cosine_scheduler,
+                               configure_encoder_finetuning, snapshot_encoders, restore_encoders)
 
 SEED = 42
 MAX_EPOCHS = 30
 PATIENCE = 7
 GRAD_CLIP = 1.0
+# Partial encoder fine-tuning (graph encoder, top MoLFormer blocks, ResNet stage 4, MLP heads)
+# at ENCODER_LR_MULT x the fusion learning rate. Set FINETUNE_ENCODERS=False for frozen encoders.
+FINETUNE_ENCODERS = True
+ENCODER_LR_MULT = 0.1
 set_seed(SEED)
 
 # Add the root for CReSS models to sys.path
@@ -148,16 +153,26 @@ spectrum_encoder = SpectrumEncoder(
     emb_dim=spectrum_best_params["emb_dim"],
 ); spectrum_encoder.load_state_dict(torch.load(os.path.join(ROOT, "checkpoints", "encoder", "train_only", "spectrum_encoder.pth"), map_location=torch.device('cpu')), strict=False)
 
-for net in (graph_encoder, image_encoder, smiles_encoder, spectrum_encoder):
-    for p in net.parameters():
-        p.requires_grad = False  # Freeze parameters
+ENCODERS = (graph_encoder, smiles_encoder, image_encoder, spectrum_encoder)
+encoder_params = configure_encoder_finetuning(*ENCODERS, enabled=FINETUNE_ENCODERS)
+encoder_snapshot = snapshot_encoders(*ENCODERS)
+print(f"Encoder fine-tuning: {FINETUNE_ENCODERS} ({sum(p.numel() for p in encoder_params)} trainable encoder params)")
 
-spectrum_encoder.missing_token.requires_grad = True  # Unfreeze missing token embedding for spectrum encoder
+
+def build_optimizer(model, lr, wd):
+    """Fusion/head parameters at `lr`, unfrozen encoder parameters at a reduced rate."""
+    enc_ids = {id(p) for p in encoder_params}
+    head_params = [p for p in model.parameters() if p.requires_grad and id(p) not in enc_ids]
+    groups = [{"params": head_params, "lr": lr}]
+    if encoder_params:
+        groups.append({"params": encoder_params, "lr": lr * ENCODER_LR_MULT})
+    return torch.optim.AdamW(groups, lr=lr, weight_decay=wd), head_params + encoder_params
 
 # ─── 4) Optuna objective ────────────────────────────────────────────────
 start_search_time = time.time() # Record the start time for performance measurement
 def objective(trial):
     set_seed(SEED)
+    restore_encoders(ENCODERS, encoder_snapshot)
     # Hyperparameters to tune
     emb_dim = trial.suggest_categorical("emb_dim", [128, 256])
     hidden_dim = trial.suggest_categorical("hidden_dim", [512, 768])
@@ -198,8 +213,7 @@ def objective(trial):
         collate_fn=collate,
     )
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=wd)
+    opt, trainable = build_optimizer(model, lr, wd)
     sched = warmup_cosine_scheduler(opt, total_steps=MAX_EPOCHS * len(train_loader))
 
     best_val_auc, best_epoch = 0.0, 0
@@ -302,12 +316,9 @@ smiles_encoder.load_state_dict(torch.load(os.path.join(ROOT, "checkpoints", "enc
 image_encoder.load_state_dict(torch.load(os.path.join(ROOT, "checkpoints", "encoder", "train_and_valid", "image_encoder.pth"), map_location=torch.device('cpu')))
 spectrum_encoder.load_state_dict(torch.load(os.path.join(ROOT, "checkpoints", "encoder", "train_and_valid", "spectrum_encoder.pth"), map_location=torch.device('cpu')), strict=False)
 
-# Freeze parameters of the encoders
-for net in (graph_encoder, image_encoder, smiles_encoder, spectrum_encoder):
-    for p in net.parameters():
-        p.requires_grad = False  # Freeze parameters
-        
-spectrum_encoder.missing_token.requires_grad = True  # Unfreeze missing token embedding for spectrum encoder
+# Same freezing policy as the search; snapshot so every ensemble seed starts from these weights
+encoder_params = configure_encoder_finetuning(*ENCODERS, enabled=FINETUNE_ENCODERS)
+encoder_snapshot = snapshot_encoders(*ENCODERS)
 
 # load the best hyperparameters
 emb_dim = best_params["emb_dim"]
@@ -327,6 +338,7 @@ os.makedirs(model_dir, exist_ok=True)
 start_train_time = time.time()  # Record the start time for train performance
 for seed in ENSEMBLE_SEEDS:
     set_seed(seed)
+    restore_encoders(ENCODERS, encoder_snapshot)
     model = MoltiTox(
         graph_encoder,
         smiles_encoder,
@@ -339,8 +351,7 @@ for seed in ENSEMBLE_SEEDS:
         num_tasks=len(labels),
         dropout=dropout
     ).to(device)
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+    opt, trainable = build_optimizer(model, lr, weight_decay)
     # Same schedule horizon as the search so stopping at best_epoch lands on the same LR
     sched = warmup_cosine_scheduler(opt, total_steps=MAX_EPOCHS * len(train_loader))
 

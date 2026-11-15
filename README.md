@@ -222,6 +222,11 @@ This fork changes the multimodal fusion and the training recipe (`models/models.
   fixed seeds, early-stopping patience 7.
 - **Seed ensemble**: the final retraining produces three models (`checkpoints/model/moltitox_seed*.pth`);
   `test.py` averages their probabilities and attention matrices.
+- **Partial encoder fine-tuning** (`FINETUNE_ENCODERS = True` in `train.py`): the graph encoder, the
+  top two MoLFormer blocks, ResNet stage 4 and the MLP heads are trained at 0.1× the fusion learning
+  rate instead of being frozen; the CReSS NMR model stays frozen. Encoder weights are reset before
+  every Optuna trial and ensemble seed so runs stay independent. Set the flag to `False` to reproduce
+  the original frozen-encoder setup (faster, less memory).
 - **Evaluation fix**: the validation loader no longer uses `drop_last`, so every validation molecule
   counts toward model selection.
 
