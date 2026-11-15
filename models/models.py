@@ -863,23 +863,55 @@ class MultiModalSpecImg(nn.Module):
             return logits, attn_weights
         return logits
 
+class FusionBlock(nn.Module):
+    """
+    Pre-LayerNorm Transformer encoder block (self-attention + feed-forward, both residual).
+    Returns the attention weights averaged over heads so they can be analysed downstream.
+    """
+    def __init__(self, emb_dim: int, num_heads: int, ff_dim: int, dropout: float):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(emb_dim)
+        self.attn = nn.MultiheadAttention(emb_dim, num_heads, dropout=dropout, batch_first=True)
+        self.ln2 = nn.LayerNorm(emb_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(emb_dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, emb_dim),
+        )
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, key_padding_mask=None):
+        h = self.ln1(x)
+        a, w = self.attn(h, h, h, key_padding_mask=key_padding_mask, need_weights=True)
+        x = x + self.drop(a)
+        x = x + self.drop(self.ff(self.ln2(x)))
+        return x, w
+
+
 class MoltiTox(nn.Module):
     """
     MoltiTox combines Graph, Image, SMILES, and Spectrum branches for multimodal learning.
-    It projects the outputs of each branch to a common embedding dimension and fuses them using self-attention.
-    The fused representation is then passed through a classification head to produce multi-task logits.
+    Each branch is projected to a common dimension and treated as a token. A learnable [CLS]
+    token plus learnable modality embeddings are added, the sequence is passed through
+    `num_fusion_layers` pre-LN Transformer blocks, and the [CLS] output feeds the
+    classification head. Molecules without an NMR spectrum have their spectrum token masked
+    out of attention instead of contributing a placeholder vector.
     Args:
         gph_encoder (nn.Module): GNN based graph encoder.
         smi_encoder (nn.Module): Transformer based SMILES encoder.
         img_encoder (nn.Module): 2D CNN based image encoder.
         spec_encoder (nn.Module): 1D CNN based spectrum encoder.
-        emb_dim (int): Dimension of the output embeddings for each branch.
-        num_heads (int): Number of attention heads for multi-head self-attention.
-        hidden_dim (int): Hidden size of each layer in the head MLP.
+        emb_dim (int): Common token dimension.
+        num_heads (int): Attention heads per fusion block.
+        hidden_dim (int): Hidden size of the head MLP and of the fusion feed-forward.
         num_layers (int): Number of layers in the head MLP.
+        num_fusion_layers (int): Number of Transformer fusion blocks.
         num_tasks (int): Number of tasks for multi-task learning.
         dropout (float): Dropout rate for the fusion layers.
     """
+    NUM_MODALITIES = 4
+
     def __init__(self,
                  gph_encoder: nn.Module,
                  smi_encoder: nn.Module,
@@ -889,6 +921,7 @@ class MoltiTox(nn.Module):
                  num_heads: int = 4,
                  hidden_dim: int = 512,
                  num_layers: int = 1,
+                 num_fusion_layers: int = 2,
                  num_tasks: int = 12,
                  dropout: float = 0.3):
         super().__init__()
@@ -898,20 +931,26 @@ class MoltiTox(nn.Module):
         self.img_encoder = img_encoder
         self.spec_encoder = spec_encoder
 
-        # Project each modality to common dimension
-        self.proj_g = nn.Linear(gph_encoder.emb_dim, emb_dim)
-        self.proj_s = nn.Linear(smi_encoder.emb_dim, emb_dim)
-        self.proj_i = nn.Linear(img_encoder.emb_dim, emb_dim)
-        self.proj_sp = nn.Linear(spec_encoder.emb_dim, emb_dim)
+        # Project each modality to common dimension (LayerNorm keeps token scales comparable)
+        self.proj_g = nn.Sequential(nn.Linear(gph_encoder.emb_dim, emb_dim), nn.LayerNorm(emb_dim))
+        self.proj_s = nn.Sequential(nn.Linear(smi_encoder.emb_dim, emb_dim), nn.LayerNorm(emb_dim))
+        self.proj_i = nn.Sequential(nn.Linear(img_encoder.emb_dim, emb_dim), nn.LayerNorm(emb_dim))
+        self.proj_sp = nn.Sequential(nn.Linear(spec_encoder.emb_dim, emb_dim), nn.LayerNorm(emb_dim))
 
-        # Multi-head self-attention over modalities
-        self.mha = nn.MultiheadAttention(
-            embed_dim=emb_dim,
-            num_heads=num_heads,
-            batch_first=True
-        )
+        # [CLS] token and modality identity embeddings (index 0 is CLS)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, emb_dim))
+        self.modality_emb = nn.Parameter(torch.zeros(1, self.NUM_MODALITIES + 1, emb_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.modality_emb, std=0.02)
+        self.token_drop = nn.Dropout(dropout)
 
-        # Define the fusion MLP layers
+        self.fusion = nn.ModuleList([
+            FusionBlock(emb_dim, num_heads, hidden_dim, dropout)
+            for _ in range(num_fusion_layers)
+        ])
+        self.final_ln = nn.LayerNorm(emb_dim)
+
+        # Define the classification head
         layers = []
         in_dim = emb_dim
         for _ in range(num_layers):
@@ -921,34 +960,35 @@ class MoltiTox(nn.Module):
                 nn.Dropout(dropout)
             ])
             in_dim = hidden_dim
-        layers.append(nn.Linear(hidden_dim, num_tasks))
+        layers.append(nn.Linear(in_dim, num_tasks))
         self.head = nn.Sequential(*layers)
 
     def forward(self, graph, ids, mask, img, spec, return_attention=False):
-        # ── Graph branch ──────────────────────────────
-        g = F.relu(self.proj_g(self.gph_encoder(graph)))
+        g = self.proj_g(self.gph_encoder(graph))
+        s = self.proj_s(self.smi_encoder(ids, mask))
+        i = self.proj_i(self.img_encoder(img))
+        sp = self.proj_sp(self.spec_encoder(spec))
 
-        # ── SMILES branch ──────────────────────
-        s = F.relu(self.proj_s(self.smi_encoder(ids, mask)))
+        B = g.size(0)
+        tokens = torch.stack([g, s, i, sp], dim=1)                   # (B, 4, D)
+        tokens = torch.cat([self.cls_token.expand(B, -1, -1), tokens], dim=1)
+        tokens = self.token_drop(tokens + self.modality_emb)
 
-        # ── Image branch ──────────────────────────────
-        i = F.relu(self.proj_i(self.img_encoder(img)))
+        # Mask the spectrum token for molecules without a spectrum; CLS and other tokens stay.
+        key_padding_mask = torch.zeros(B, self.NUM_MODALITIES + 1, dtype=torch.bool, device=g.device)
+        key_padding_mask[:, -1] = torch.tensor([p is None for p in spec], device=g.device)
 
-        # ── Spectrum branch ──────────────────────────────
-        sp = F.relu(self.proj_sp(self.spec_encoder(spec)))
+        attn_weights = None
+        for block in self.fusion:
+            tokens, attn_weights = block(tokens, key_padding_mask=key_padding_mask)
 
-        # ── Stack features ─────────────────────────────
-        modal_feats = torch.stack([g, s, i, sp], dim=1)
-
-        # ── Multi-head self-attention fusion ─────────────
-        attn_out, attn_weights = self.mha(modal_feats, modal_feats, modal_feats)
-
-        # ── Pool across modality tokens ─────────────────
-        fused = attn_out.mean(dim=1)
-
-        # ── Classification head ───────────────────────────
+        fused = self.final_ln(tokens[:, 0])
         logits = self.head(fused)
 
         if return_attention:
-            return logits, attn_weights
+            # Drop the CLS row/column and renormalise so downstream analysis sees a
+            # (B, 4, 4) modality matrix whose rows sum to 1.
+            modal_attn = attn_weights[:, 1:, 1:]
+            modal_attn = modal_attn / modal_attn.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+            return logits, modal_attn
         return logits

@@ -18,6 +18,13 @@ if ROOT not in sys.path:
 
 from models.models        import GraphEncoder, SMILESEncoder, ImageEncoder, SpectrumEncoder, MoltiTox
 from utils.dataset     import GraphDataset, SMILESDataset, ImageDataset, SpectrumDataset, MoltiToxDataset
+from utils.training    import set_seed, compute_pos_weight, masked_bce_loss, warmup_cosine_scheduler
+
+SEED = 42
+MAX_EPOCHS = 30
+PATIENCE = 7
+GRAD_CLIP = 1.0
+set_seed(SEED)
 
 # Add the root for CReSS models to sys.path
 CRESS_ROOT = os.path.join(ROOT, "experiments", "spectrum")
@@ -76,7 +83,11 @@ g_full = ConcatDataset([g_tr, g_va])
 s_full = ConcatDataset([s_tr, s_va])
 i_full = ConcatDataset([i_tr, i_va])
 sp_full = ConcatDataset([sp_tr, sp_va])
-    
+
+# Class-balance weights from the labelled training entries (recomputed for train+valid below)
+pos_weight_tr = compute_pos_weight(g_tr.labels)
+pos_weight_full = compute_pos_weight(np.concatenate([g_tr.labels, g_va.labels], axis=0))
+
 def collate(batch):
     """
     Custom collate function to handle batching of graph, smiles, image, and spectrum data.
@@ -146,10 +157,12 @@ spectrum_encoder.missing_token.requires_grad = True  # Unfreeze missing token em
 # ─── 4) Optuna objective ────────────────────────────────────────────────
 start_search_time = time.time() # Record the start time for performance measurement
 def objective(trial):
+    set_seed(SEED)
     # Hyperparameters to tune
     emb_dim = trial.suggest_categorical("emb_dim", [128, 256])
     hidden_dim = trial.suggest_categorical("hidden_dim", [512, 768])
     num_layers = trial.suggest_categorical("num_layers", [1])
+    num_fusion_layers = trial.suggest_categorical("num_fusion_layers", [1, 2])
     lr    =    trial.suggest_categorical("lr", [1e-4, 3e-4])
     wd    =    trial.suggest_categorical("weight_decay", [1e-5, 1e-4])
     dropout = trial.suggest_categorical("dropout", [0.3, 0.4, 0.5])
@@ -163,11 +176,10 @@ def objective(trial):
         emb_dim=emb_dim,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
+        num_fusion_layers=num_fusion_layers,
         dropout=dropout,
         num_tasks=len(labels)
     ).to(device)
-
-    opt = torch.optim.AdamW(model.parameters(), lr = lr, weight_decay=wd)
 
     train_loader = DataLoader(
         MoltiToxDataset(g_tr, s_tr, i_tr, sp_tr), 
@@ -177,17 +189,21 @@ def objective(trial):
         collate_fn=collate,
         drop_last=True
     )
+    # No drop_last here: every validation molecule must count toward the AUC
     valid_loader = DataLoader(
         MoltiToxDataset(g_va, s_va, i_va, sp_va),
         batch_size= 64,
         shuffle=False,
         pin_memory=False,
         collate_fn=collate,
-        drop_last=True
     )
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=wd)
+    sched = warmup_cosine_scheduler(opt, total_steps=MAX_EPOCHS * len(train_loader))
+
     best_val_auc, best_epoch = 0.0, 0
-    patience = 5
-    for epoch in range(1, 31):
+    for epoch in range(1, MAX_EPOCHS + 1):
         # --- train ---
         model.train()
         for g, t_ids, t_mask, img, ppm, y in train_loader:
@@ -199,15 +215,14 @@ def objective(trial):
                 y.to(device)
             )
             logits = model(g, t_ids, t_mask, img, ppm)
-
-            mask_loss = (y >= 0).float()              
-            targets   = y.clamp(min=0)            
-            per_ent   = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")          
-            loss = (per_ent * mask_loss).sum() / mask_loss.sum()
+            loss = masked_bce_loss(logits, y, pos_weight_tr)
 
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
             opt.step()
+            sched.step()
+
         # print(f"Epoch {epoch: 2d}")
         
         # --- validate ---
@@ -246,7 +261,7 @@ def objective(trial):
             best_val_auc, best_epoch = val_auc, epoch
             trial.set_user_attr("best_model_state", model.state_dict())
             trial.set_user_attr("best_epoch", epoch)
-        elif epoch - best_epoch >= patience:
+        elif epoch - best_epoch >= PATIENCE:
             break
 
     return best_val_auc
@@ -294,59 +309,68 @@ for net in (graph_encoder, image_encoder, smiles_encoder, spectrum_encoder):
         
 spectrum_encoder.missing_token.requires_grad = True  # Unfreeze missing token embedding for spectrum encoder
 
-# load the best hyperparameters and create the model
+# load the best hyperparameters
 emb_dim = best_params["emb_dim"]
 hidden_dim = best_params["hidden_dim"]
 num_layers = best_params["num_layers"]
+num_fusion_layers = best_params["num_fusion_layers"]
 dropout = best_params["dropout"]
 lr = best_params["lr"]
 weight_decay = best_params["weight_decay"]
-epoch      = best_params["best_epoch"]
+best_epoch = best_params["best_epoch"]
 
-model = MoltiTox(
-    graph_encoder,
-    smiles_encoder,
-    image_encoder,
-    spectrum_encoder,
-    emb_dim = emb_dim,
-    hidden_dim= hidden_dim,
-    num_layers= num_layers,
-    num_tasks=len(labels),
-    dropout=dropout
-).to(device)
-opt = torch.optim.Adam(
-    model.parameters(),
-    lr=lr,
-    weight_decay=weight_decay
-)
+# Retrain one model per seed on train + valid; test.py averages their probabilities.
+ENSEMBLE_SEEDS = [42, 43, 44]
+model_dir = os.path.join(ROOT, "checkpoints", "model")
+os.makedirs(model_dir, exist_ok=True)
 
-# train the model on the full dataset (train + valid)
 start_train_time = time.time()  # Record the start time for train performance
-for epoch in range(1, epoch + 1):
-    model.train()
-    for g, t_ids, t_mask, img, ppm, y in train_loader:
-        g, t_ids, t_mask, img, y = (
-            g.to(device),
-            t_ids.to(device),
-            t_mask.to(device),
-            img.to(device),
-            y.to(device)
-        )
-        logits = model(g, t_ids, t_mask, img, ppm)
-        mask_loss = (y >= 0).float()              
-        targets   = y.clamp(min=0)            
-        per_ent   = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")          
-        loss = (per_ent * mask_loss).sum() / mask_loss.sum()
+for seed in ENSEMBLE_SEEDS:
+    set_seed(seed)
+    model = MoltiTox(
+        graph_encoder,
+        smiles_encoder,
+        image_encoder,
+        spectrum_encoder,
+        emb_dim = emb_dim,
+        hidden_dim= hidden_dim,
+        num_layers= num_layers,
+        num_fusion_layers=num_fusion_layers,
+        num_tasks=len(labels),
+        dropout=dropout
+    ).to(device)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+    # Same schedule horizon as the search so stopping at best_epoch lands on the same LR
+    sched = warmup_cosine_scheduler(opt, total_steps=MAX_EPOCHS * len(train_loader))
 
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-    print(f"Epoch {epoch: 2d}")
-    
+    for epoch in range(1, best_epoch + 1):
+        model.train()
+        for g, t_ids, t_mask, img, ppm, y in train_loader:
+            g, t_ids, t_mask, img, y = (
+                g.to(device),
+                t_ids.to(device),
+                t_mask.to(device),
+                img.to(device),
+                y.to(device)
+            )
+            logits = model(g, t_ids, t_mask, img, ppm)
+            loss = masked_bce_loss(logits, y, pos_weight_full)
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
+            opt.step()
+            sched.step()
+        print(f"Seed {seed} Epoch {epoch: 2d}")
+
+    torch.save(model.state_dict(), os.path.join(model_dir, f"moltitox_seed{seed}.pth"))
+
 end_train_time = time.time() # Record the end time for train performance
 print(f"Total training time: {end_train_time - start_train_time:.2f} seconds")
 
+# Keep the legacy single-model path pointing at the first ensemble member
 torch.save(
-    model.state_dict(),
-    os.path.join(ROOT, "checkpoints", "model", "moltitox.pth")
+    torch.load(os.path.join(model_dir, f"moltitox_seed{ENSEMBLE_SEEDS[0]}.pth"), map_location="cpu"),
+    os.path.join(model_dir, "moltitox.pth")
 )

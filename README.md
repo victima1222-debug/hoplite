@@ -207,6 +207,28 @@ If you wish to reproduce the preprocessing pipeline or need access to the raw sp
 
 The pre-processed data (CSV files, images, and binary spectra) are already available and can be used directly without running the preprocessing pipeline.
 
+## Improvements over the original MoltiTox
+
+This fork changes the multimodal fusion and the training recipe (`models/models.py`,
+`utils/training.py`, `experiments/multimodal/moltitox/`):
+
+- **Transformer fusion**: a learnable `[CLS]` token plus modality embeddings, 1–2 pre-LayerNorm
+  Transformer blocks (attention + feed-forward with residuals) and LayerNorm on every projected
+  modality, replacing single-layer attention followed by mean pooling.
+- **Missing-spectrum masking**: molecules without an NMR spectrum (about 64% of Tox21) have the
+  spectrum token masked out of attention instead of contributing a placeholder vector.
+- **Class-balanced loss**: per-task `pos_weight` (clamped to 10) in the masked BCE.
+- **Schedule and stability**: AdamW everywhere, linear warmup + cosine decay, gradient clipping,
+  fixed seeds, early-stopping patience 7.
+- **Seed ensemble**: the final retraining produces three models (`checkpoints/model/moltitox_seed*.pth`);
+  `test.py` averages their probabilities and attention matrices.
+- **Evaluation fix**: the validation loader no longer uses `drop_last`, so every validation molecule
+  counts toward model selection.
+
+`num_fusion_layers` is part of the Optuna search; saved `moltitox_best_params.json` files from the
+original code are read with a default of 2. Old `moltitox.pth` checkpoints are not compatible with
+the new fusion module and must be retrained.
+
 ## Running Experiments
 
 ### Running All Experiments

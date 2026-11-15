@@ -5,6 +5,7 @@ from sklearn.metrics import roc_auc_score
 import torch.nn.functional as F
 from torchvision import transforms
 import json
+import glob
 import time
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
@@ -136,29 +137,36 @@ with open(os.path.join(ROOT, "checkpoints", "parameters", "moltitox_best_params.
 emb_dim = moltitox_best_params["emb_dim"]
 hidden_dim = moltitox_best_params["hidden_dim"]
 num_layers = moltitox_best_params["num_layers"]
+num_fusion_layers = moltitox_best_params.get("num_fusion_layers", 2)
 dropout = moltitox_best_params["dropout"]
 epoch      = moltitox_best_params["best_epoch"]
 
-# ─── 5) Create the model ──────────────────────────────
-model = MoltiTox(
-    graph_encoder,
-    smiles_encoder,
-    image_encoder,
-    spectrum_encoder,
-    emb_dim = emb_dim,
-    hidden_dim= hidden_dim,
-    num_layers= num_layers,
-    num_tasks=len(labels),
-    dropout=dropout
-).to(device)
-model.load_state_dict(
-    torch.load(os.path.join(ROOT, "checkpoints", "model", "moltitox.pth"), map_location=device),
-    strict=False  # Allow missing_token parameter to be uninitialized
-)
+# ─── 5) Create the models (seed ensemble; falls back to the single legacy checkpoint) ──
+model_dir = os.path.join(ROOT, "checkpoints", "model")
+ckpt_paths = sorted(glob.glob(os.path.join(model_dir, "moltitox_seed*.pth"))) \
+    or [os.path.join(model_dir, "moltitox.pth")]
+print(f"Evaluating ensemble of {len(ckpt_paths)} model(s): {[os.path.basename(p) for p in ckpt_paths]}")
+
+models = []
+for path in ckpt_paths:
+    m = MoltiTox(
+        graph_encoder,
+        smiles_encoder,
+        image_encoder,
+        spectrum_encoder,
+        emb_dim = emb_dim,
+        hidden_dim= hidden_dim,
+        num_layers= num_layers,
+        num_fusion_layers=num_fusion_layers,
+        num_tasks=len(labels),
+        dropout=dropout
+    ).to(device)
+    m.load_state_dict(torch.load(path, map_location=device), strict=False)
+    m.eval()
+    models.append(m)
 
 # ─── 6) Test model ─────────────────────────────────────
 start_test_time = time.time()  # Record the start time for test performance
-model.eval()
 
 all_y, all_p, all_attn = [], [], []
 with torch.no_grad():
@@ -168,12 +176,14 @@ with torch.no_grad():
         t_mask = t_mask.to(device)
         img = img.to(device)
         # ppm list can contain None for missing spectrum data
-        logits, attn_weights = model(g, t_ids, t_mask, img, ppm, return_attention=True)
-
-        probs = torch.sigmoid(logits)
-        all_p.append(probs.cpu())
+        probs_sum, attn_sum = 0.0, 0.0
+        for m in models:
+            logits, attn_weights = m(g, t_ids, t_mask, img, ppm, return_attention=True)
+            probs_sum = probs_sum + torch.sigmoid(logits)
+            attn_sum = attn_sum + attn_weights
+        all_p.append((probs_sum / len(models)).cpu())
         all_y.append(y)
-        all_attn.append(attn_weights.cpu())
+        all_attn.append((attn_sum / len(models)).cpu())
 
 y_true = torch.cat(all_y).numpy()
 y_pred = torch.cat(all_p).numpy()
