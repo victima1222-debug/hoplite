@@ -26,9 +26,13 @@ MAX_EPOCHS = 30
 PATIENCE = 7
 GRAD_CLIP = 1.0
 # Partial encoder fine-tuning (graph encoder, top MoLFormer blocks, ResNet stage 4, MLP heads)
-# at ENCODER_LR_MULT x the fusion learning rate. Set FINETUNE_ENCODERS=False for frozen encoders.
-FINETUNE_ENCODERS = True
-ENCODER_LR_MULT = 0.1
+# at ENCODER_LR_MULT x the fusion learning rate. Override from the shell, e.g.
+#   FINETUNE_ENCODERS=0 python train.py          (frozen encoders, as in the original paper)
+#   ENCODER_LR_MULT=0.03 python train.py
+FINETUNE_ENCODERS = os.environ.get("FINETUNE_ENCODERS", "1") not in ("0", "false", "False")
+ENCODER_LR_MULT = float(os.environ.get("ENCODER_LR_MULT", "0.1"))
+# Separate Optuna study per configuration so resumes never mix settings
+STUDY_NAME = f"moltitox_ft{int(FINETUNE_ENCODERS)}_mult{ENCODER_LR_MULT:g}"
 set_seed(SEED)
 
 # Add the root for CReSS models to sys.path
@@ -285,7 +289,7 @@ def objective(trial):
 N_TRIALS = 20
 study_db = os.path.join(ROOT, "checkpoints", "moltitox_optuna.db")
 study = optuna.create_study(
-    study_name="moltitox",
+    study_name=STUDY_NAME,
     storage=f"sqlite:///{study_db}",
     load_if_exists=True,
     direction="maximize",
@@ -296,7 +300,7 @@ done = sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
 for t in study.trials:
     if t.state == optuna.trial.TrialState.RUNNING:
         study.tell(t.number, state=optuna.trial.TrialState.FAIL)
-print(f"Optuna study: {done}/{N_TRIALS} trials already complete")
+print(f"Optuna study {STUDY_NAME}: {done}/{N_TRIALS} trials already complete")
 if done < N_TRIALS:
     study.optimize(objective, n_trials=N_TRIALS - done)
 
