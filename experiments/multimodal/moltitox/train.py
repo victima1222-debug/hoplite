@@ -273,7 +273,6 @@ def objective(trial):
         # --- early stopping ---
         if val_auc > best_val_auc:
             best_val_auc, best_epoch = val_auc, epoch
-            trial.set_user_attr("best_model_state", model.state_dict())
             trial.set_user_attr("best_epoch", epoch)
         elif epoch - best_epoch >= PATIENCE:
             break
@@ -281,11 +280,25 @@ def objective(trial):
     return best_val_auc
 
 # ─── Run Optuna ───────────────────────────────────────────────────────────────
+# The study is persisted to SQLite after every trial, so an interrupted run resumes
+# where it stopped instead of starting the search over.
+N_TRIALS = 20
+study_db = os.path.join(ROOT, "checkpoints", "moltitox_optuna.db")
 study = optuna.create_study(
+    study_name="moltitox",
+    storage=f"sqlite:///{study_db}",
+    load_if_exists=True,
     direction="maximize",
     sampler=optuna.samplers.TPESampler(seed=42)
 )
-study.optimize(objective, n_trials=20)
+done = sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
+# Drop trials left half-finished by a previous interrupted run
+for t in study.trials:
+    if t.state == optuna.trial.TrialState.RUNNING:
+        study.tell(t.number, state=optuna.trial.TrialState.FAIL)
+print(f"Optuna study: {done}/{N_TRIALS} trials already complete")
+if done < N_TRIALS:
+    study.optimize(objective, n_trials=N_TRIALS - done)
 
 end_search_time = time.time() # Record the end time for hyperparameter search
 print(f"Total Searching completed in {end_search_time - start_search_time:.2f} seconds")
